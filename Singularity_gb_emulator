@@ -84,13 +84,14 @@ Combined renderer + input handler for mGBA in headless X.
 Single process so rendering and input don't fight over the terminal.
 Modes: kitty (pixel), ascii (img2txt), blocks (chafa)
 """
-import os, sys, time, signal, base64, subprocess, threading, select, shutil
+import os, sys, time, signal, base64, subprocess, threading, select, shutil, struct
 
 DISPLAY_NUM = sys.argv[1] if len(sys.argv) > 1 else "99"
 RENDER_MODE = sys.argv[2] if len(sys.argv) > 2 else "kitty"
 os.environ["DISPLAY"] = f":{DISPLAY_NUM}"
 
 TMPFRAME = "/tmp/.gba_frame.png"
+TMPSCALED = "/tmp/.gba_scaled.png"
 
 # WASD=dpad, L=A, P=B, E=Start, Q=Select, O/K=L/R
 KEY_MAP = {
@@ -135,33 +136,56 @@ def xdo(win, key, action="key"):
 
 # ===================== RENDERERS =====================
 
+def get_term_pixel_size():
+    """Get terminal pixel dimensions."""
+    try:
+        import fcntl, termios
+        r = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b'\x00'*8)
+        rows, cols, xpix, ypix = struct.unpack('HHHH', r)
+        if xpix > 0 and ypix > 0:
+            return xpix, ypix
+    except: pass
+    # Fallback: estimate from cell count (assume ~8x16 per cell)
+    try:
+        sz = shutil.get_terminal_size((120, 40))
+        return sz.columns * 8, sz.lines * 16
+    except:
+        return 960, 640
+
 def render_kitty(filepath):
     """Render using Kitty terminal graphics protocol — actual pixels.
-    No resizing needed — Kitty scales the image to fill the terminal
-    when we don't specify width/height constraints."""
+    Resizes to terminal pixel dimensions with nearest-neighbor (sharp pixels),
+    slightly oversized so there's no black border — Kitty clips the overflow."""
     try:
-        with open(filepath, 'rb') as f:
+        xpix, ypix = get_term_pixel_size()
+
+        # Oversize by 10% to guarantee no black border
+        # Kitty clips anything that extends beyond the terminal
+        xpix = int(xpix * 1.1)
+        ypix = int(ypix * 1.1)
+
+        # Resize to exact dimensions with nearest-neighbor, stretched to fill
+        subprocess.run(
+            ["convert", filepath,
+             "-filter", "Point",
+             "-resize", f"{xpix}x{ypix}!",
+             TMPSCALED],
+            timeout=1, capture_output=True)
+        target = TMPSCALED if os.path.exists(TMPSCALED) else filepath
+
+        with open(target, 'rb') as f:
             data = f.read()
         b64 = base64.b64encode(data).decode('ascii')
 
-        # Get terminal size in cells so Kitty scales image to fill
-        try:
-            sz = shutil.get_terminal_size((120, 40))
-            cols = sz.columns
-            rows = sz.lines
-        except:
-            cols, rows = 120, 40
-
-        out = '\033[H'                # cursor home
-        out += '\033_Ga=d;\033\\'     # delete old images
+        out = '\033[H'
+        out += '\033_Ga=d;\033\\'
 
         CHUNK = 4096
         chunks = [b64[i:i+CHUNK] for i in range(0, len(b64), CHUNK)]
         for i, chunk in enumerate(chunks):
             last = (i == len(chunks) - 1)
             if i == 0:
-                # c=cols, r=rows tells Kitty to scale to this many cells
-                out += f'\033_Ga=T,f=100,c={cols},r={rows},m={0 if last else 1};{chunk}\033\\'
+                out += f'\033_Ga=T,f=100,m={0 if last else 1};{chunk}\033\\'
             else:
                 out += f'\033_Gm={0 if last else 1};{chunk}\033\\'
 
@@ -203,23 +227,12 @@ def render_thread():
           'blocks': render_blocks}.get(RENDER_MODE, render_ascii)
     while running:
         try:
-            # ffmpeg single-frame grab is faster than ImageMagick import
-            subprocess.run(
-                ["ffmpeg", "-y", "-f", "x11grab", "-framerate", "1",
-                 "-i", f":{DISPLAY_NUM}", "-frames:v", "1",
-                 "-update", "1", TMPFRAME],
+            subprocess.run(["import","-window","root","-silent", TMPFRAME],
                 timeout=2, capture_output=True)
             if os.path.exists(TMPFRAME) and os.path.getsize(TMPFRAME) > 0:
                 fn(TMPFRAME)
-        except:
-            # Fallback to import if ffmpeg fails
-            try:
-                subprocess.run(["import","-window","root","-silent", TMPFRAME],
-                    timeout=2, capture_output=True)
-                if os.path.exists(TMPFRAME) and os.path.getsize(TMPFRAME) > 0:
-                    fn(TMPFRAME)
-            except: pass
-        time.sleep(0.016)  # ~60fps target (actual will be limited by grab speed)
+        except: pass
+        time.sleep(0.01)  # minimize artificial delay — actual fps limited by import+convert speed
 
 def key_repeat_thread():
     """Background thread: re-send held keys for continuous movement."""
@@ -253,8 +266,9 @@ def cleanup(*args):
             import termios
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         except: pass
-    try: os.remove(TMPFRAME)
-    except: pass
+    for f in [TMPFRAME, TMPSCALED]:
+        try: os.remove(f)
+        except: pass
     sys.exit(0)
 
 # ===================== MAIN =====================
