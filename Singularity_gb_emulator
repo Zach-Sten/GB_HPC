@@ -1,0 +1,460 @@
+Bootstrap: docker
+From: ubuntu:20.04
+
+%labels
+  Maintainer Zachary Stensland
+  Description GameBoy Emulator Container (mGBA + terminal rendering)
+  Version 3.0
+
+%post
+  export DEBIAN_FRONTEND=noninteractive
+  export APT_LISTCHANGES_FRONTEND=none
+
+  TZ=America/Los_Angeles
+  ln -snf /usr/share/zoneinfo/$TZ /etc/localtime
+  echo $TZ > /etc/timezone
+
+  apt-get update
+  apt-get install -y --no-install-recommends locales
+  echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+  locale-gen en_US.utf8
+  /usr/sbin/update-locale LANG=en_US.UTF-8
+  export LC_ALL=en_US.UTF-8
+  export LANG=en_US.UTF-8
+
+  apt-get update
+  apt-get install -y \
+    apt-utils build-essential curl git nano unzip vim wget tree \
+    ffmpeg imagemagick software-properties-common \
+    xvfb x11-xserver-utils x11-apps xdotool \
+    python3-pip python3-dev python3-cffi \
+    libglib2.0-dev libmagickwand-dev \
+    autoconf automake libtool gtk-doc-tools cmake \
+    libsdl2-dev libzip-dev zlib1g-dev libpng-dev libedit-dev \
+    coreutils bc ncurses-term caca-utils libaa-bin
+
+  # Build chafa from source
+  cd /tmp
+  git clone https://github.com/hpjansson/chafa.git
+  cd chafa && git checkout 1.12.4
+  ./autogen.sh && make -j$(nproc) && make install
+  cd / && rm -rf /tmp/chafa
+  ldconfig
+
+  # Build mGBA from source
+  cd /tmp && rm -rf /tmp/mgba
+  git clone https://github.com/mgba-emu/mgba.git
+  cd mgba && mkdir build && cd build
+  cmake .. -DBUILD_SDL=ON -DBUILD_QT=OFF -DBUILD_LIBRETRO=OFF \
+    -DUSE_FFMPEG=OFF -DUSE_ZLIB=ON -DUSE_LIBAV=OFF \
+    -DBUILD_STATIC=OFF -DUSE_DISCORD_RPC=OFF -DUSE_MINIZIP=OFF -DENABLE_AUDIO=OFF
+  make -j$(nproc) && make install
+  cd / && rm -rf /tmp/mgba
+
+  apt-get clean && rm -rf /var/lib/apt/lists/*
+
+  # --- mGBA config ---
+  mkdir -p /etc/mgba
+  cat > /etc/mgba/mgba.ini << 'MGBA_CONFIG'
+[general]
+savegamePath=/game/saves
+savestatePath=/game/states
+screenshotPath=/game/screenshots
+
+[keybinds]
+keyA=l
+keyB=p
+keyStart=e
+keySelect=q
+keyUp=w
+keyDown=s
+keyLeft=a
+keyRight=d
+keyL=o
+keyR=k
+MGBA_CONFIG
+
+  # =============================================================
+  # COMBINED EMULATOR UI — renderer + input in one process
+  # =============================================================
+  cat > /usr/local/bin/emulator_ui.py << 'UIPY'
+#!/usr/bin/env python3
+"""
+Combined renderer + input handler for mGBA in headless X.
+Single process so rendering and input don't fight over the terminal.
+Modes: kitty (pixel), ascii (img2txt), blocks (chafa)
+"""
+import os, sys, time, signal, base64, subprocess, threading, select, shutil
+
+DISPLAY_NUM = sys.argv[1] if len(sys.argv) > 1 else "99"
+RENDER_MODE = sys.argv[2] if len(sys.argv) > 2 else "kitty"
+os.environ["DISPLAY"] = f":{DISPLAY_NUM}"
+
+TMPFRAME = "/tmp/.gba_frame.png"
+
+# WASD=dpad, L=A, P=B, E=Start, Q=Select, O/K=L/R
+KEY_MAP = {
+    'w': 'w', 'W': 'w', 'a': 'a', 'A': 'a',
+    's': 's', 'S': 's', 'd': 'd', 'D': 'd',
+    'l': 'l', 'L': 'l', 'p': 'p', 'P': 'p',
+    'e': 'e', 'E': 'e', 'q': 'q', 'Q': 'q',
+    'o': 'o', 'O': 'o', 'k': 'k', 'K': 'k',
+}
+
+REPEAT_INTERVAL = 0.05
+running = True
+held_keys = {}
+lock = threading.Lock()
+mgba_win = None
+old_settings = None
+fd = None
+
+def find_mgba_window():
+    """Find the mGBA window ID on the virtual X display."""
+    for _ in range(20):
+        for pat in ["mGBA", "mgba"]:
+            try:
+                r = subprocess.run(["xdotool","search","--name",pat],
+                    capture_output=True, text=True, timeout=2)
+                w = r.stdout.strip().split('\n')
+                if w and w[0]: return w[0]
+            except: pass
+        try:
+            r = subprocess.run(["xdotool","search","--onscreen","--name",""],
+                capture_output=True, text=True, timeout=2)
+            w = r.stdout.strip().split('\n')
+            if w and w[0]: return w[0]
+        except: pass
+        time.sleep(1)
+    return None
+
+def xdo(win, key, action="key"):
+    """Send a key event to the mgba window."""
+    subprocess.Popen(["xdotool", action, "--window", win, key],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+# ===================== RENDERERS =====================
+
+def render_kitty(filepath):
+    """Render using Kitty terminal graphics protocol — actual pixels.
+    No resizing needed — Kitty scales the image to fill the terminal
+    when we don't specify width/height constraints."""
+    try:
+        with open(filepath, 'rb') as f:
+            data = f.read()
+        b64 = base64.b64encode(data).decode('ascii')
+
+        # Get terminal size in cells so Kitty scales image to fill
+        try:
+            sz = shutil.get_terminal_size((120, 40))
+            cols = sz.columns
+            rows = sz.lines
+        except:
+            cols, rows = 120, 40
+
+        out = '\033[H'                # cursor home
+        out += '\033_Ga=d;\033\\'     # delete old images
+
+        CHUNK = 4096
+        chunks = [b64[i:i+CHUNK] for i in range(0, len(b64), CHUNK)]
+        for i, chunk in enumerate(chunks):
+            last = (i == len(chunks) - 1)
+            if i == 0:
+                # c=cols, r=rows tells Kitty to scale to this many cells
+                out += f'\033_Ga=T,f=100,c={cols},r={rows},m={0 if last else 1};{chunk}\033\\'
+            else:
+                out += f'\033_Gm={0 if last else 1};{chunk}\033\\'
+
+        sys.stdout.write(out)
+        sys.stdout.flush()
+    except: pass
+
+def render_ascii(filepath):
+    """Render using libcaca img2txt — true ASCII art characters."""
+    try:
+        sz = shutil.get_terminal_size((120, 40))
+        r = subprocess.run(
+            ["img2txt", "-W", str(sz.columns), "-H", str(sz.lines - 1),
+             "-f", "utf8", filepath],
+            capture_output=True, text=True, timeout=2)
+        if r.stdout:
+            sys.stdout.write('\033[H' + r.stdout)
+            sys.stdout.flush()
+    except: pass
+
+def render_blocks(filepath):
+    """Render using chafa — Unicode half-block characters."""
+    try:
+        sz = shutil.get_terminal_size((120, 40))
+        r = subprocess.run(
+            ["chafa", "--size", f"{sz.columns}x{sz.lines - 1}",
+             "--format", "symbols", filepath],
+            capture_output=True, text=True, timeout=2)
+        if r.stdout:
+            sys.stdout.write('\033[H' + r.stdout)
+            sys.stdout.flush()
+    except: pass
+
+# ===================== THREADS =====================
+
+def render_thread():
+    """Background thread: grab X screenshots and render them."""
+    fn = {'kitty': render_kitty, 'ascii': render_ascii,
+          'blocks': render_blocks}.get(RENDER_MODE, render_ascii)
+    while running:
+        try:
+            # ffmpeg single-frame grab is faster than ImageMagick import
+            subprocess.run(
+                ["ffmpeg", "-y", "-f", "x11grab", "-framerate", "1",
+                 "-i", f":{DISPLAY_NUM}", "-frames:v", "1",
+                 "-update", "1", TMPFRAME],
+                timeout=2, capture_output=True)
+            if os.path.exists(TMPFRAME) and os.path.getsize(TMPFRAME) > 0:
+                fn(TMPFRAME)
+        except:
+            # Fallback to import if ffmpeg fails
+            try:
+                subprocess.run(["import","-window","root","-silent", TMPFRAME],
+                    timeout=2, capture_output=True)
+                if os.path.exists(TMPFRAME) and os.path.getsize(TMPFRAME) > 0:
+                    fn(TMPFRAME)
+            except: pass
+        time.sleep(0.016)  # ~60fps target (actual will be limited by grab speed)
+
+def key_repeat_thread():
+    """Background thread: re-send held keys for continuous movement."""
+    while running:
+        with lock:
+            for c in list(held_keys.keys()):
+                x = KEY_MAP.get(c)
+                if x and mgba_win:
+                    xdo(mgba_win, x, "keydown")
+        time.sleep(REPEAT_INTERVAL)
+
+# ===================== CLEANUP =====================
+
+def cleanup(*args):
+    global running
+    running = False
+    # Release all held keys
+    with lock:
+        for c in list(held_keys.keys()):
+            x = KEY_MAP.get(c)
+            if x and mgba_win:
+                xdo(mgba_win, x, "keyup")
+        held_keys.clear()
+    # Restore terminal
+    sys.stdout.write('\033[?25h')  # show cursor
+    if RENDER_MODE == 'kitty':
+        sys.stdout.write('\033_Ga=d;\033\\')
+    sys.stdout.flush()
+    if old_settings is not None:
+        try:
+            import termios
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except: pass
+    try: os.remove(TMPFRAME)
+    except: pass
+    sys.exit(0)
+
+# ===================== MAIN =====================
+
+def main():
+    global mgba_win, old_settings, fd
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    # Set up raw terminal input
+    fd = sys.stdin.fileno()
+    try:
+        import termios, tty
+        if os.isatty(fd):
+            old_settings = termios.tcgetattr(fd)
+            tty.setraw(fd)
+        else:
+            # stdin not a TTY — try /dev/tty directly
+            try:
+                tfd = os.open('/dev/tty', os.O_RDONLY | os.O_NOCTTY)
+                os.dup2(tfd, fd)
+                os.close(tfd)
+                old_settings = termios.tcgetattr(fd)
+                tty.setraw(fd)
+                sys.stdin = os.fdopen(fd, 'r')
+            except: pass
+    except: pass
+
+    # Clear screen, hide cursor
+    sys.stdout.write('\033[2J\033[H\033[?25l')
+    sys.stdout.flush()
+
+    # Find mgba window for input
+    mgba_win = find_mgba_window()
+
+    # Start background threads
+    threading.Thread(target=render_thread, daemon=True).start()
+    threading.Thread(target=key_repeat_thread, daemon=True).start()
+
+    # Main loop: read keypresses (foreground, owns the TTY)
+    last_time = 0
+    while running:
+        try:
+            rlist, _, _ = select.select([sys.stdin], [], [], REPEAT_INTERVAL)
+            if rlist:
+                char = sys.stdin.read(1)
+
+                # Ctrl+C → quit
+                if char == '\x03':
+                    cleanup()
+
+                # Skip escape sequences (kitty graphics responses leak here)
+                if char == '\x1b':
+                    while True:
+                        r2, _, _ = select.select([sys.stdin], [], [], 0.01)
+                        if r2:
+                            c = sys.stdin.read(1)
+                            if c == '\\' or c.isalpha():
+                                break
+                        else:
+                            break
+                    continue
+
+                # Forward game keys
+                if char in KEY_MAP:
+                    with lock:
+                        if char not in held_keys:
+                            if mgba_win:
+                                xdo(mgba_win, KEY_MAP[char], "keydown")
+                            held_keys[char] = True
+                    last_time = time.time()
+            else:
+                # No input — release held keys after timeout
+                if time.time() - last_time > REPEAT_INTERVAL * 3:
+                    with lock:
+                        for c in list(held_keys.keys()):
+                            x = KEY_MAP.get(c)
+                            if x and mgba_win:
+                                xdo(mgba_win, x, "keyup")
+                        held_keys.clear()
+        except: pass
+
+if __name__ == "__main__":
+    main()
+UIPY
+  chmod +x /usr/local/bin/emulator_ui.py
+
+  # --- Verify ---
+  echo ""
+  echo "========================================"
+  echo "  GAMEBOY EMULATOR BUILD VERIFICATION"
+  echo "========================================"
+  which mgba      && echo "mgba:      OK" || echo "FAIL: mgba"
+  which ffmpeg    && echo "ffmpeg:    OK" || echo "FAIL: ffmpeg"
+  which chafa     && echo "chafa:     OK" || echo "FAIL: chafa"
+  which import    && echo "import:    OK" || echo "FAIL: import"
+  which xdotool   && echo "xdotool:   OK" || echo "FAIL: xdotool"
+  which img2txt   && echo "img2txt:   OK" || echo "FAIL: img2txt"
+  echo "========================================"
+
+%environment
+  export DISPLAY=:99
+  export LC_ALL=en_US.UTF-8
+  export LANG=en_US.UTF-8
+  export SDL_AUDIODRIVER=dummy
+  export PULSE_SERVER=/dev/null
+  if ! infocmp "$TERM" >/dev/null 2>&1; then
+    export TERM=xterm-256color
+  fi
+
+%runscript
+  ROM=$(find /game -maxdepth 1 -name "*.gba" | head -1)
+  if [ -z "$ROM" ]; then
+    echo "❌ No .gba ROM found in /game/"
+    exit 1
+  fi
+  echo "✅ ROM: $ROM"
+
+  DISPLAY_NUM=99
+  while [ -f /tmp/.X${DISPLAY_NUM}-lock ]; do DISPLAY_NUM=$((DISPLAY_NUM+1)); done
+  export DISPLAY=":${DISPLAY_NUM}"
+  echo "✅ Using display :${DISPLAY_NUM}"
+
+  cleanup() {
+    printf '\033[?25h'
+    kill $MGBA_PID $XVFB_PID 2>/dev/null
+    wait 2>/dev/null
+    echo ""
+    echo "👋 Emulator closed."
+  }
+  trap cleanup EXIT INT TERM
+
+  echo "🖥  Starting Xvfb..."
+  Xvfb :${DISPLAY_NUM} -screen 0 480x320x24 +extension RANDR &
+  XVFB_PID=$!
+  sleep 2
+  if ! kill -0 $XVFB_PID 2>/dev/null; then
+    echo "❌ Xvfb failed!"; exit 1
+  fi
+  echo "✅ Xvfb running"
+
+  echo "🎮 Starting mgba..."
+  DISPLAY=:${DISPLAY_NUM} mgba -c /etc/mgba/mgba.ini "$ROM" &
+  MGBA_PID=$!
+  sleep 3
+  if ! kill -0 $MGBA_PID 2>/dev/null; then
+    echo "❌ mgba failed!"; kill $XVFB_PID 2>/dev/null; exit 1
+  fi
+  echo "✅ mgba running"
+
+  echo "🔍 Verifying display..."
+  DISPLAY=:${DISPLAY_NUM} import -window root -silent /tmp/.verify.png 2>/dev/null
+  if [ -f /tmp/.verify.png ] && [ -s /tmp/.verify.png ]; then
+    echo "✅ Display is rendering"
+    rm -f /tmp/.verify.png
+  else
+    echo "⚠  Display may not be rendering"
+  fi
+
+  RENDER_MODE="${RENDER_MODE:-auto}"
+  if [ "$RENDER_MODE" = "auto" ]; then
+    if [ "$TERM" = "xterm-kitty" ] || [ -n "$KITTY_PID" ] || [ -n "$KITTY_WINDOW_ID" ]; then
+      RENDER_MODE="kitty"
+    else
+      RENDER_MODE="ascii"
+    fi
+  fi
+
+  clear
+  echo "🎮 $(basename "$ROM") — ${RENDER_MODE} mode — Ctrl+C to quit"
+  sleep 1
+
+  # Single combined process handles both rendering and input
+  python3 /usr/local/bin/emulator_ui.py "$DISPLAY_NUM" "$RENDER_MODE"
+
+%test
+  which mgba     && echo "mgba OK"     || exit 1
+  which Xvfb     && echo "Xvfb OK"     || exit 1
+  which ffmpeg   && echo "ffmpeg OK"   || exit 1
+  which chafa    && echo "chafa OK"    || exit 1
+  which import   && echo "import OK"   || exit 1
+  which xdotool  && echo "xdotool OK"  || exit 1
+  which img2txt  && echo "img2txt OK"  || exit 1
+  echo "Smoke test passed"
+
+%help
+  GameBoy Emulator Container v3.0
+  ================================
+  Controls:
+    W/A/S/D = D-Pad    L = A    P = B    E = Start    Q = Select
+    O = L bumper    K = R bumper    Ctrl+C = Quit
+
+  Render modes (set RENDER_MODE env var):
+    kitty  — native pixel rendering (auto-detected in Kitty terminal)
+    ascii  — ASCII art with @#%*+=:. characters
+    blocks — Unicode half-block pixels
+    Example: RENDER_MODE=ascii ./critical_analysis.sh /path/to/games firered
+
+  Build:
+    sudo singularity build ga_em.sif Singularity_gb_emulator
+
+  Run:
+    ./critical_analysis.sh /path/to/games firered
