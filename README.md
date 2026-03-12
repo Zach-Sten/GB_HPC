@@ -30,7 +30,7 @@ Worried your admin or others are going to flag you playing games? No worries. Wi
 
 ## How It Works
 
-The container runs [mGBA](https://mgba.io/) on a headless virtual display inside Singularity, captures frames, and streams them to your terminal using one of three rendering modes. Input is handled via raw terminal keypresses forwarded to the emulator through `xdotool`.
+The container runs [mGBA](https://mgba.io/) on a headless virtual display inside Singularity, captures frames, and streams them to your terminal using one of four rendering modes. Input is handled via raw terminal keypresses forwarded to the emulator through `xdotool`.
 
 ## 🖥️ Render Modes
 
@@ -39,7 +39,8 @@ Set the render mode with the `RENDER_MODE` environment variable:
 | Mode | Command | Description |
 |------|---------|-------------|
 | **Kitty** | `RENDER_MODE=kitty` | Native pixel rendering via the Kitty graphics protocol. Best quality — actual pixels in your terminal. Auto-detected if you're using Kitty. |
-| **ASCII** | `RENDER_MODE=ascii` | True ASCII art using `libcaca`. Renders with `@#%&*+=-:.` characters and ANSI colors. Looks cool as hell. |
+| **ASCII** | `RENDER_MODE=ascii` | Colored ASCII art using `libcaca`. Renders with `@#%&*+=-:.` characters on a transparent background — just the characters, no filled background. |
+| **BW** | `RENDER_MODE=bw` | Monochrome ASCII art — just characters in your terminal's default text color. No colors, no background. Clean and minimal. |
 | **Blocks** | `RENDER_MODE=blocks` | Unicode half-block characters via `chafa`. A middle ground between pixels and ASCII. |
 
 If you don't set `RENDER_MODE`, it auto-detects: Kitty terminal → `kitty` mode, everything else → `ascii` mode.
@@ -49,8 +50,8 @@ If you don't set `RENDER_MODE`, it auto-detects: Kitty terminal → `kitty` mode
 For the best experience, use a terminal that supports modern rendering:
 
 - **[Kitty](https://sw.kovidgoyal.net/kitty/)** — Best option. Supports native pixel rendering for the sharpest output.
-- **[iTerm2](https://iterm2.com/)** — Great option on macOS. Works well with ASCII and block modes.
-- **Any terminal** — ASCII mode works everywhere, even over basic SSH.
+- **[iTerm2](https://iterm2.com/)** — Great option on macOS. Works well with all modes.
+- **Any terminal** — ASCII and BW modes work everywhere, even over basic SSH.
 
 ## 🕹️ Controls
 
@@ -103,6 +104,9 @@ sudo singularity build ga_em.sif Singularity_gb_emulator
 
 # Force a specific render mode
 RENDER_MODE=ascii ./critical_analysis.sh /path/to/games pkmon_frr
+
+# Monochrome ASCII — looks great on dark terminals
+RENDER_MODE=bw ./critical_analysis.sh /path/to/games pkmon_frr
 ```
 
 ## 🔧 Requirements

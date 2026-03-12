@@ -60,6 +60,10 @@ From: ubuntu:20.04
 savegamePath=/game/saves
 savestatePath=/game/states
 screenshotPath=/game/screenshots
+fullscreen=1
+
+[sdl]
+fullscreen=1
 
 [keybinds]
 keyA=l
@@ -166,25 +170,40 @@ def get_term_pixel_size():
     except:
         return 1596, 1224
 
+_last_term_size = (0, 0)
+
 def render_kitty(filepath):
     """Render using Kitty terminal graphics protocol — actual pixels.
-    Resizes to terminal pixel dimensions with nearest-neighbor (sharp pixels),
-    oversized to guarantee full coverage — Kitty clips the overflow."""
+    Detects terminal size each frame. If it matches the Xvfb, sends directly.
+    If the terminal was resized, uses convert to rescale."""
+    global _last_term_size
     try:
-        xpix, ypix = get_term_pixel_size()
+        cur_size = get_term_pixel_size()
 
-        # Oversize by 20% to guarantee no black border
-        xpix = int(xpix * 1.2)
-        ypix = int(ypix * 1.2)
+        # Check if we need to resize (terminal size changed)
+        need_resize = (cur_size != _last_term_size)
+        _last_term_size = cur_size
+        xpix, ypix = cur_size
 
-        # Resize to exact dimensions with nearest-neighbor, stretched to fill
-        subprocess.run(
-            ["convert", filepath,
-             "-filter", "Point",
-             "-resize", f"{xpix}x{ypix}!",
-             TMPSCALED],
-            timeout=1, capture_output=True)
-        target = TMPSCALED if os.path.exists(TMPSCALED) else filepath
+        if need_resize or not os.path.exists(TMPSCALED):
+            # Terminal was resized — rescale with nearest-neighbor
+            subprocess.run(
+                ["convert", filepath,
+                 "-filter", "Point",
+                 "-resize", f"{xpix}x{ypix}!",
+                 TMPSCALED],
+                timeout=1, capture_output=True)
+
+            target = TMPSCALED if os.path.exists(TMPSCALED) else filepath
+        else:
+            # Same size — just re-convert (fast, same dimensions cached by IM)
+            subprocess.run(
+                ["convert", filepath,
+                 "-filter", "Point",
+                 "-resize", f"{xpix}x{ypix}!",
+                 TMPSCALED],
+                timeout=1, capture_output=True)
+            target = TMPSCALED if os.path.exists(TMPSCALED) else filepath
 
         with open(target, 'rb') as f:
             data = f.read()
@@ -207,15 +226,18 @@ def render_kitty(filepath):
     except: pass
 
 def render_ascii(filepath):
-    """Render using libcaca img2txt — true ASCII art characters."""
+    """Render using libcaca img2txt — colored ASCII art, transparent background."""
     try:
         sz = shutil.get_terminal_size((120, 40))
         r = subprocess.run(
-            ["img2txt", "-W", str(sz.columns), "-H", str(sz.lines - 1),
+            ["img2txt", "-W", str(sz.columns), "-H", str(sz.lines * 2),
              "-f", "utf8", filepath],
             capture_output=True, text=True, timeout=2)
         if r.stdout:
-            sys.stdout.write('\033[H' + r.stdout)
+            # Strip background color codes (48;5;xxx and 48;2;r;g;b) to get transparent bg
+            import re
+            clean = re.sub(r'\033\[48;[25][;0-9]*m', '', r.stdout)
+            sys.stdout.write('\033[H\033[2J' + clean)
             sys.stdout.flush()
     except: pass
 
@@ -228,7 +250,23 @@ def render_blocks(filepath):
              "--format", "symbols", filepath],
             capture_output=True, text=True, timeout=2)
         if r.stdout:
-            sys.stdout.write('\033[H' + r.stdout)
+            sys.stdout.write('\033[H\033[2J' + r.stdout)
+            sys.stdout.flush()
+    except: pass
+
+def render_bw(filepath):
+    """Render using libcaca img2txt — monochrome ASCII, terminal default color only."""
+    try:
+        sz = shutil.get_terminal_size((120, 40))
+        r = subprocess.run(
+            ["img2txt", "-W", str(sz.columns), "-H", str(sz.lines * 2),
+             "-f", "utf8", filepath],
+            capture_output=True, text=True, timeout=2)
+        if r.stdout:
+            # Strip ALL ANSI color/style codes — just raw characters
+            import re
+            clean = re.sub(r'\033\[[0-9;]*m', '', r.stdout)
+            sys.stdout.write('\033[H\033[2J' + clean)
             sys.stdout.flush()
     except: pass
 
@@ -237,7 +275,7 @@ def render_blocks(filepath):
 def render_thread():
     """Background thread: grab X screenshots and render them."""
     fn = {'kitty': render_kitty, 'ascii': render_ascii,
-          'blocks': render_blocks}.get(RENDER_MODE, render_ascii)
+          'blocks': render_blocks, 'bw': render_bw}.get(RENDER_MODE, render_ascii)
     while running:
         try:
             subprocess.run(["import","-window","root","-silent", TMPFRAME],
@@ -405,6 +443,46 @@ UIPY
   export DISPLAY=":${DISPLAY_NUM}"
   echo "✅ Using display :${DISPLAY_NUM}"
 
+  # --- Detect terminal pixel size so Xvfb matches ---
+  # Does detection + rounding to multiple of 8 all in Python
+  XVFB_RES=$(python3 -c "
+import struct, shutil, os, sys
+w, h = 0, 0
+for fd_num in [1, 0, 2]:
+    try:
+        import fcntl, termios
+        r = fcntl.ioctl(fd_num, termios.TIOCGWINSZ, b'\x00'*8)
+        rows, cols, xpix, ypix = struct.unpack('HHHH', r)
+        if xpix > 0 and ypix > 0:
+            w, h = xpix, ypix
+            break
+    except: pass
+if w == 0:
+    try:
+        fd = os.open('/dev/tty', os.O_RDONLY)
+        import fcntl, termios
+        r = fcntl.ioctl(fd, termios.TIOCGWINSZ, b'\x00'*8)
+        os.close(fd)
+        rows, cols, xpix, ypix = struct.unpack('HHHH', r)
+        if xpix > 0 and ypix > 0:
+            w, h = xpix, ypix
+    except: pass
+if w == 0:
+    try:
+        sz = shutil.get_terminal_size((120, 40))
+        w, h = sz.columns * 14, sz.lines * 34
+    except:
+        w, h = 1920, 1080
+# Round up to multiple of 8 for Xvfb
+w = ((w + 7) // 8) * 8
+h = ((h + 7) // 8) * 8
+print(f'{w}x{h}')
+" 2>/dev/null)
+
+  # Fallback if detection failed
+  [ -z "$XVFB_RES" ] && XVFB_RES="1920x1080"
+  echo "✅ Xvfb resolution: $XVFB_RES"
+
   cleanup() {
     printf '\033[?25h'
     kill $MGBA_PID $XVFB_PID 2>/dev/null
@@ -414,8 +492,8 @@ UIPY
   }
   trap cleanup EXIT INT TERM
 
-  echo "🖥  Starting Xvfb..."
-  Xvfb :${DISPLAY_NUM} -screen 0 480x320x24 +extension RANDR &
+  echo "🖥  Starting Xvfb at ${XVFB_RES}..."
+  Xvfb :${DISPLAY_NUM} -screen 0 ${XVFB_RES}x24 +extension RANDR &
   XVFB_PID=$!
   sleep 2
   if ! kill -0 $XVFB_PID 2>/dev/null; then
@@ -423,8 +501,9 @@ UIPY
   fi
   echo "✅ Xvfb running"
 
+  # Launch mgba — tell it to use the full display
   echo "🎮 Starting mgba..."
-  DISPLAY=:${DISPLAY_NUM} mgba -c /etc/mgba/mgba.ini "$ROM" &
+  DISPLAY=:${DISPLAY_NUM} SDL_VIDEO_WINDOW_POS="0,0" mgba -c /etc/mgba/mgba.ini -f "$ROM" &
   MGBA_PID=$!
   sleep 3
   if ! kill -0 $MGBA_PID 2>/dev/null; then
@@ -476,9 +555,10 @@ UIPY
 
   Render modes (set RENDER_MODE env var):
     kitty  — native pixel rendering (auto-detected in Kitty terminal)
-    ascii  — ASCII art with @#%*+=:. characters
+    ascii  — colored ASCII art with transparent background
+    bw     — monochrome ASCII art (terminal default color only)
     blocks — Unicode half-block pixels
-    Example: RENDER_MODE=ascii ./critical_analysis.sh /path/to/games firered
+    Example: RENDER_MODE=bw ./critical_analysis.sh /path/to/games firered
 
   Build:
     sudo singularity build ga_em.sif Singularity_gb_emulator
