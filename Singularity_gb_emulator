@@ -137,32 +137,45 @@ def xdo(win, key, action="key"):
 # ===================== RENDERERS =====================
 
 def get_term_pixel_size():
-    """Get terminal pixel dimensions."""
+    """Get terminal pixel dimensions. Tries multiple approaches."""
+    # Try TIOCGWINSZ on multiple file descriptors
+    for try_fd in [sys.stdout.fileno(), sys.stdin.fileno(), sys.stderr.fileno()]:
+        try:
+            import fcntl, termios
+            r = fcntl.ioctl(try_fd, termios.TIOCGWINSZ, b'\x00'*8)
+            rows, cols, xpix, ypix = struct.unpack('HHHH', r)
+            if xpix > 0 and ypix > 0:
+                return xpix, ypix
+        except: pass
+
+    # Try /dev/tty directly
     try:
         import fcntl, termios
-        r = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, b'\x00'*8)
+        tty_fd = os.open('/dev/tty', os.O_RDONLY)
+        r = fcntl.ioctl(tty_fd, termios.TIOCGWINSZ, b'\x00'*8)
+        os.close(tty_fd)
         rows, cols, xpix, ypix = struct.unpack('HHHH', r)
         if xpix > 0 and ypix > 0:
             return xpix, ypix
     except: pass
-    # Fallback: estimate from cell count (assume ~8x16 per cell)
+
+    # Fallback: assume HiDPI (~14x34 per cell based on typical Retina displays)
     try:
         sz = shutil.get_terminal_size((120, 40))
-        return sz.columns * 8, sz.lines * 16
+        return sz.columns * 14, sz.lines * 34
     except:
-        return 960, 640
+        return 1596, 1224
 
 def render_kitty(filepath):
     """Render using Kitty terminal graphics protocol — actual pixels.
     Resizes to terminal pixel dimensions with nearest-neighbor (sharp pixels),
-    slightly oversized so there's no black border — Kitty clips the overflow."""
+    oversized to guarantee full coverage — Kitty clips the overflow."""
     try:
         xpix, ypix = get_term_pixel_size()
 
-        # Oversize by 10% to guarantee no black border
-        # Kitty clips anything that extends beyond the terminal
-        xpix = int(xpix * 1.1)
-        ypix = int(ypix * 1.1)
+        # Oversize by 20% to guarantee no black border
+        xpix = int(xpix * 1.2)
+        ypix = int(ypix * 1.2)
 
         # Resize to exact dimensions with nearest-neighbor, stretched to fill
         subprocess.run(
