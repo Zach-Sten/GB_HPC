@@ -23,13 +23,12 @@ Ever been on your HPC, deep in analysis, thinking *"I deserve a break, but I don
 Worried your admin or others are going to flag you playing games? No worries. With a discreet name and run ID labeled "critical_analysis" you'll always *appear* on top of things.
 
 <p align="center">
-  <img src="img/demo_pic.png" width="800">
+  <img src="img/demo_pic.png" width="400">
 </p>
 
 ---
 
 > ⚠️ **This repo is actively under development — check back for updates!**
-Things are pretty glitchy at the momet but im working on fixing it! 😅
 
 ---
 
@@ -50,7 +49,7 @@ The container runs [mGBA](https://mgba.io/) on a headless virtual display inside
 | `P` | B Button |
 | `E` | Start |
 | `Q` | Select |
-| `O` / `K` | L / R Bumpers |
+| `F` / `R` | L / R Bumpers |
 | `Ctrl+C` | Quit |
 
 ## 📁 Setup

@@ -130,8 +130,8 @@ KEY_MAP = {
     'p': 'z',       'P': 'z',       # B button
     'e': 'Return',  'E': 'Return',  # Start
     'q': 'BackSpace','Q': 'BackSpace', # Select
-    'o': 'a',       'O': 'a',       # L bumper
-    'k': 's',       'K': 's',       # R bumper
+    'f': 'a',       'F': 'a',       # L bumper
+    'r': 's',       'R': 's',       # R bumper
 }
 
 REPEAT_INTERVAL = 0.05
