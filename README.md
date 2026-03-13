@@ -20,38 +20,24 @@
 
 Ever been on your HPC, deep in analysis, thinking *"I deserve a break, but I don't want to leave my terminal"*? Same. This repo packages a full GameBoy Advance emulator into a Singularity container that renders directly in your terminal. No X forwarding, no GUI, no VNC — just your game, your terminal, and your time management skills.
 
-Worried your admin or others are going to flag you playing games? No worries. With a discreet name and run ID labeled "critical_analysis" you'll always *appear* ontop of things.
+Worried your admin or others are going to flag you playing games? No worries. With a discreet name and run ID labeled "critical_analysis" you'll always *appear* on top of things.
+
+<img src="img/demo_pic.png" width="600" alt="Pokemon Fire Red running in terminal"
 
 ---
 
 > ⚠️ **This repo is actively under development — check back for updates!**
+Things are pretty glitchy at the momet but im working on fixing it! 😅
 
 ---
 
 ## How It Works
 
-The container runs [mGBA](https://mgba.io/) on a headless virtual display inside Singularity, captures frames, and streams them to your terminal using one of four rendering modes. Input is handled via raw terminal keypresses forwarded to the emulator through `xdotool`.
+The container runs [mGBA](https://mgba.io/) on a headless virtual display inside Singularity, captures frames with ffmpeg, and streams them to your terminal using the Kitty graphics protocol. Input is captured from your keyboard and forwarded to the emulator via XTEST. The display dynamically resizes to fit your terminal window.
 
-## 🖥️ Render Modes
+## 🖥️ Recommended Terminal
 
-Set the render mode with the `RENDER_MODE` environment variable:
-
-| Mode | Command | Description |
-|------|---------|-------------|
-| **Kitty** | `RENDER_MODE=kitty` | Native pixel rendering via the Kitty graphics protocol. Best quality — actual pixels in your terminal. Auto-detected if you're using Kitty. |
-| **ASCII** | `RENDER_MODE=ascii` | Colored ASCII art using `libcaca`. Renders with `@#%&*+=-:.` characters on a transparent background — just the characters, no filled background. |
-| **BW** | `RENDER_MODE=bw` | Monochrome ASCII art — just characters in your terminal's default text color. No colors, no background. Clean and minimal. |
-| **Blocks** | `RENDER_MODE=blocks` | Unicode half-block characters via `chafa`. A middle ground between pixels and ASCII. |
-
-If you don't set `RENDER_MODE`, it auto-detects: Kitty terminal → `kitty` mode, everything else → `ascii` mode.
-
-### Recommended Terminals
-
-For the best experience, use a terminal that supports modern rendering:
-
-- **[Kitty](https://sw.kovidgoyal.net/kitty/)** — Best option. Supports native pixel rendering for the sharpest output.
-- **[iTerm2](https://iterm2.com/)** — Great option on macOS. Works well with all modes.
-- **Any terminal** — ASCII and BW modes work everywhere, even over basic SSH.
+**[iTerm2](https://iterm2.com/)** is the recommended terminal. It supports the graphics protocol used for rendering and works well over SSH to your HPC nodes.
 
 ## 🕹️ Controls
 
@@ -96,26 +82,20 @@ sudo singularity build ga_em.sif Singularity_gb_emulator
 ### Run
 
 ```bash
-# Launch with game selection
+# Launch with game selection menu
 ./critical_analysis.sh /path/to/games
 
 # Launch a specific game directly
 ./critical_analysis.sh /path/to/games pkmon_frr
-
-# Force a specific render mode
-RENDER_MODE=ascii ./critical_analysis.sh /path/to/games pkmon_frr
-
-# Monochrome ASCII — looks great on dark terminals
-RENDER_MODE=bw ./critical_analysis.sh /path/to/games pkmon_frr
 ```
 
 ## 🔧 Requirements
 
 - **Singularity** (or Apptainer) on your HPC
 - **A GBA ROM** (`.gba` file)
-- **A terminal** (Kitty recommended, but anything works)
+- **[iTerm2](https://iterm2.com/)** (recommended)
 
-Everything else (mGBA, chafa, libcaca, xdotool, Xvfb, ffmpeg, ImageMagick) is built into the container.
+Everything else (mGBA, xdotool, Xvfb, ffmpeg, PIL, python-xlib) is built into the container.
 
 ## 📦 What's in the Container
 
@@ -123,13 +103,12 @@ Everything else (mGBA, chafa, libcaca, xdotool, Xvfb, ffmpeg, ImageMagick) is bu
 |------|---------|
 | [mGBA](https://mgba.io/) | GBA emulator (built from source) |
 | [Xvfb](https://www.x.org/) | Virtual X display |
-| [chafa](https://hpjansson.org/chafa/) | Unicode block rendering (built from source) |
-| [libcaca](http://caca.zoy.org/wiki/libcaca) | ASCII art rendering |
 | [xdotool](https://github.com/jordansissel/xdotool) | Input forwarding |
-| [ffmpeg](https://ffmpeg.org/) | Frame capture |
-| [ImageMagick](https://imagemagick.org/) | Image processing |
+| [ffmpeg](https://ffmpeg.org/) | Frame capture and streaming |
+| [Pillow](https://pillow.readthedocs.io/) | Frame scaling and FPS overlay |
+| [python-xlib](https://github.com/python-xlib/python-xlib) | Low-latency key injection via XTEST |
 
-## Incase you were wondering...
+## In case you were wondering...
 
 This project provides a container build for running your own legally obtained ROMs. No ROMs are included.
 

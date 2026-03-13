@@ -4,11 +4,14 @@ From: ubuntu:20.04
 %labels
   Maintainer Zachary Stensland
   Description GameBoy Emulator Container (mGBA + terminal rendering)
-  Version 3.0
+  Version 5.5
 
 %post
   export DEBIAN_FRONTEND=noninteractive
   export APT_LISTCHANGES_FRONTEND=none
+
+  # Fix for Singularity builds where /dev/null may not exist
+  [ ! -e /dev/null ] && mknod -m 666 /dev/null c 1 3 || true
 
   TZ=America/Los_Angeles
   ln -snf /usr/share/zoneinfo/$TZ /etc/localtime
@@ -27,13 +30,15 @@ From: ubuntu:20.04
     apt-utils build-essential curl git nano unzip vim wget tree \
     ffmpeg imagemagick software-properties-common \
     xvfb x11-xserver-utils x11-apps xdotool \
-    python3-pip python3-dev python3-cffi \
+    python3-pip python3-dev python3-cffi python3-pil \
     libglib2.0-dev libmagickwand-dev \
     autoconf automake libtool gtk-doc-tools cmake \
     libsdl2-dev libzip-dev zlib1g-dev libpng-dev libedit-dev \
-    coreutils bc ncurses-term caca-utils libaa-bin
+    coreutils bc ncurses-term caca-utils libaa-bin \
+    fonts-dejavu-core unclutter
 
-  # Build chafa from source
+  pip3 install Pillow
+
   cd /tmp
   git clone https://github.com/hpjansson/chafa.git
   cd chafa && git checkout 1.12.4
@@ -41,7 +46,6 @@ From: ubuntu:20.04
   cd / && rm -rf /tmp/chafa
   ldconfig
 
-  # Build mGBA from source
   cd /tmp && rm -rf /tmp/mgba
   git clone https://github.com/mgba-emu/mgba.git
   cd mgba && mkdir build && cd build
@@ -53,7 +57,16 @@ From: ubuntu:20.04
 
   apt-get clean && rm -rf /var/lib/apt/lists/*
 
-  # --- mGBA config ---
+  # Create a blank 1x1 cursor to hide the X pointer
+  mkdir -p /usr/share/icons/blank
+  cat > /tmp/make_blank_cursor.py << 'CURSPY'
+from PIL import Image
+img = Image.new('RGBA', (1, 1), (0, 0, 0, 0))
+img.save('/usr/share/icons/blank/blank.png')
+CURSPY
+  python3 /tmp/make_blank_cursor.py
+  rm /tmp/make_blank_cursor.py
+
   mkdir -p /etc/mgba
   cat > /etc/mgba/mgba.ini << 'MGBA_CONFIG'
 [general]
@@ -64,46 +77,61 @@ fullscreen=1
 
 [sdl]
 fullscreen=1
-
-[keybinds]
-keyA=l
-keyB=p
-keyStart=e
-keySelect=q
-keyUp=w
-keyDown=s
-keyLeft=a
-keyRight=d
-keyL=o
-keyR=k
 MGBA_CONFIG
 
   # =============================================================
-  # COMBINED EMULATOR UI — renderer + input in one process
+  # COMBINED EMULATOR UI v5.4
+  # - JPEG output (smaller than PNG, f=100 auto-detects)
+  # - No delete-before-draw (no flicker)
+  # - X cursor hidden via xsetroot
+  # - Proper TTY restore on cleanup
+  # - All render modes working (8bit, ascii, bw, blocks)
+  # - SIGWINCH dynamic resize
+  # - FPS burned into image
+  # - Warnings suppressed
   # =============================================================
   cat > /usr/local/bin/emulator_ui.py << 'UIPY'
 #!/usr/bin/env python3
 """
 Combined renderer + input handler for mGBA in headless X.
-Single process so rendering and input don't fight over the terminal.
-Modes: kitty (pixel), ascii (img2txt), blocks (chafa)
+v5.4: JPEG, no flicker, all modes, proper cleanup.
 """
-import os, sys, time, signal, base64, subprocess, threading, select, shutil, struct
+import warnings
+warnings.filterwarnings("ignore")
+
+import os, sys, time, signal, base64, subprocess, threading, struct, shutil, io
+
+from PIL import Image, ImageDraw, ImageFont
+
+# ===================== DEBUG LOGGING =====================
+DEBUG_LOG = "/tmp/emulator_debug.log"
+def dbg(msg):
+    try:
+        with open(DEBUG_LOG, "a") as f:
+            f.write(f"[{time.time():.2f}] {msg}\n")
+    except:
+        pass
 
 DISPLAY_NUM = sys.argv[1] if len(sys.argv) > 1 else "99"
-RENDER_MODE = sys.argv[2] if len(sys.argv) > 2 else "kitty"
+RENDER_MODE = sys.argv[2] if len(sys.argv) > 2 else "8bit"
 os.environ["DISPLAY"] = f":{DISPLAY_NUM}"
 
-TMPFRAME = "/tmp/.gba_frame.png"
-TMPSCALED = "/tmp/.gba_scaled.png"
+dbg(f"Starting: display=:{DISPLAY_NUM} mode={RENDER_MODE}")
 
-# WASD=dpad, L=A, P=B, E=Start, Q=Select, O/K=L/R
+# Map user keypresses -> mGBA default SDL keybindings
+# mGBA defaults: A=X, B=Z, L=A, R=S, Start=Return, Select=BackSpace
+# D-pad: Up/Down/Left/Right arrow keys
 KEY_MAP = {
-    'w': 'w', 'W': 'w', 'a': 'a', 'A': 'a',
-    's': 's', 'S': 's', 'd': 'd', 'D': 'd',
-    'l': 'l', 'L': 'l', 'p': 'p', 'P': 'p',
-    'e': 'e', 'E': 'e', 'q': 'q', 'Q': 'q',
-    'o': 'o', 'O': 'o', 'k': 'k', 'K': 'k',
+    'w': 'Up',      'W': 'Up',       # D-pad up
+    'a': 'Left',    'A': 'Left',     # D-pad left
+    's': 'Down',    'S': 'Down',     # D-pad down
+    'd': 'Right',   'D': 'Right',    # D-pad right
+    'l': 'x',       'L': 'x',       # A button
+    'p': 'z',       'P': 'z',       # B button
+    'e': 'Return',  'E': 'Return',  # Start
+    'q': 'BackSpace','Q': 'BackSpace', # Select
+    'o': 'a',       'O': 'a',       # L bumper
+    'k': 's',       'K': 's',       # R bumper
 }
 
 REPEAT_INTERVAL = 0.05
@@ -114,179 +142,333 @@ mgba_win = None
 old_settings = None
 fd = None
 
-def find_mgba_window():
-    """Find the mGBA window ID on the virtual X display."""
-    for _ in range(20):
-        for pat in ["mGBA", "mgba"]:
-            try:
-                r = subprocess.run(["xdotool","search","--name",pat],
-                    capture_output=True, text=True, timeout=2)
-                w = r.stdout.strip().split('\n')
-                if w and w[0]: return w[0]
-            except: pass
+_frame_count = 0
+_fps = 0.0
+_fps_last_time = time.time()
+_total_frames = 0
+
+# Dynamic terminal size
+_term_xpix = 0
+_term_ypix = 0
+_term_lock = threading.Lock()
+
+# Load font once
+try:
+    _font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
+    _font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 10)
+except:
+    _font = ImageFont.load_default()
+    _font_small = _font
+
+def update_fps():
+    global _frame_count, _fps, _fps_last_time, _total_frames
+    _frame_count += 1
+    _total_frames += 1
+    now = time.time()
+    elapsed = now - _fps_last_time
+    if elapsed >= 1.0:
+        _fps = _frame_count / elapsed
+        _frame_count = 0
+        _fps_last_time = now
+        dbg(f"FPS: {_fps:.1f}  total_frames: {_total_frames}")
+
+def detect_term_pixel_size():
+    import fcntl, termios
+    for try_fd in [1, 0, 2]:
         try:
-            r = subprocess.run(["xdotool","search","--onscreen","--name",""],
-                capture_output=True, text=True, timeout=2)
-            w = r.stdout.strip().split('\n')
-            if w and w[0]: return w[0]
-        except: pass
-        time.sleep(1)
-    return None
-
-def xdo(win, key, action="key"):
-    """Send a key event to the mgba window."""
-    subprocess.Popen(["xdotool", action, "--window", win, key],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-# ===================== RENDERERS =====================
-
-def get_term_pixel_size():
-    """Get terminal pixel dimensions. Tries multiple approaches."""
-    # Try TIOCGWINSZ on multiple file descriptors
-    for try_fd in [sys.stdout.fileno(), sys.stdin.fileno(), sys.stderr.fileno()]:
-        try:
-            import fcntl, termios
-            r = fcntl.ioctl(try_fd, termios.TIOCGWINSZ, b'\x00'*8)
+            r = fcntl.ioctl(try_fd, termios.TIOCGWINSZ, b'\x00' * 8)
             rows, cols, xpix, ypix = struct.unpack('HHHH', r)
             if xpix > 0 and ypix > 0:
                 return xpix, ypix
-        except: pass
-
-    # Try /dev/tty directly
+        except:
+            pass
     try:
+        tfd = os.open('/dev/tty', os.O_RDONLY)
         import fcntl, termios
-        tty_fd = os.open('/dev/tty', os.O_RDONLY)
-        r = fcntl.ioctl(tty_fd, termios.TIOCGWINSZ, b'\x00'*8)
-        os.close(tty_fd)
+        r = fcntl.ioctl(tfd, termios.TIOCGWINSZ, b'\x00' * 8)
+        os.close(tfd)
         rows, cols, xpix, ypix = struct.unpack('HHHH', r)
         if xpix > 0 and ypix > 0:
             return xpix, ypix
-    except: pass
-
-    # Fallback: assume HiDPI (~14x34 per cell based on typical Retina displays)
+    except:
+        pass
     try:
         sz = shutil.get_terminal_size((120, 40))
         return sz.columns * 14, sz.lines * 34
     except:
         return 1596, 1224
 
-_last_term_size = (0, 0)
+def refresh_term_size():
+    global _term_xpix, _term_ypix
+    xpix, ypix = detect_term_pixel_size()
+    with _term_lock:
+        _term_xpix = xpix
+        _term_ypix = ypix
+    dbg(f"Terminal size: {xpix}x{ypix}")
 
-def render_kitty(filepath):
-    """Render using Kitty terminal graphics protocol — actual pixels.
-    Detects terminal size each frame. If it matches the Xvfb, sends directly.
-    If the terminal was resized, uses convert to rescale."""
-    global _last_term_size
+def get_term_pixel_size():
+    with _term_lock:
+        return _term_xpix, _term_ypix
+
+def on_sigwinch(signum, frame):
+    refresh_term_size()
+
+def find_mgba_window():
+    for _ in range(20):
+        for pat in ["mGBA", "mgba"]:
+            try:
+                r = subprocess.run(["xdotool", "search", "--name", pat],
+                    capture_output=True, text=True, timeout=2)
+                w = r.stdout.strip().split('\n')
+                if w and w[0]:
+                    dbg(f"Found mGBA window: {w[0]}")
+                    return w[0]
+            except:
+                pass
+        try:
+            r = subprocess.run(["xdotool", "search", "--onscreen", "--name", ""],
+                capture_output=True, text=True, timeout=2)
+            w = r.stdout.strip().split('\n')
+            if w and w[0]:
+                dbg(f"Found window (fallback): {w[0]}")
+                return w[0]
+        except:
+            pass
+        time.sleep(1)
+    dbg("WARNING: No mGBA window found")
+    return None
+
+def xdo(win, key, action="key"):
+    # Use XTEST (no --window) so SDL accepts the events.
+    # Always use "key" (press+release) for reliability.
+    # Explicitly set DISPLAY to make sure xdotool talks to the right X server.
+    env = {**os.environ, "DISPLAY": f":{DISPLAY_NUM}"}
+    cmd = ["xdotool", "key", "--clearmodifiers", key]
     try:
-        cur_size = get_term_pixel_size()
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env)
+    except Exception as e:
+        dbg(f"xdo FAILED: {cmd} error={e}")
 
-        # Check if we need to resize (terminal size changed)
-        need_resize = (cur_size != _last_term_size)
-        _last_term_size = cur_size
-        xpix, ypix = cur_size
+# ===================== KITTY GRAPHICS PROTOCOL =====================
 
-        if need_resize or not os.path.exists(TMPSCALED):
-            # Terminal was resized — rescale with nearest-neighbor
-            subprocess.run(
-                ["convert", filepath,
-                 "-filter", "Point",
-                 "-resize", f"{xpix}x{ypix}!",
-                 TMPSCALED],
-                timeout=1, capture_output=True)
-
-            target = TMPSCALED if os.path.exists(TMPSCALED) else filepath
-        else:
-            # Same size — just re-convert (fast, same dimensions cached by IM)
-            subprocess.run(
-                ["convert", filepath,
-                 "-filter", "Point",
-                 "-resize", f"{xpix}x{ypix}!",
-                 TMPSCALED],
-                timeout=1, capture_output=True)
-            target = TMPSCALED if os.path.exists(TMPSCALED) else filepath
-
-        with open(target, 'rb') as f:
-            data = f.read()
-        b64 = base64.b64encode(data).decode('ascii')
-
+def send_to_kitty(img_data):
+    """Send image data via Kitty graphics protocol.
+    f=100 auto-detects format (works for both JPEG and PNG).
+    No delete — just transmit at cursor home, overwrites previous.
+    q=2 suppresses terminal responses."""
+    try:
+        b64 = base64.b64encode(img_data).decode('ascii')
+        # Cursor home — image draws over whatever was there
         out = '\033[H'
-        out += '\033_Ga=d;\033\\'
-
         CHUNK = 4096
-        chunks = [b64[i:i+CHUNK] for i in range(0, len(b64), CHUNK)]
+        chunks = [b64[i:i + CHUNK] for i in range(0, len(b64), CHUNK)]
         for i, chunk in enumerate(chunks):
             last = (i == len(chunks) - 1)
             if i == 0:
-                out += f'\033_Ga=T,f=100,m={0 if last else 1};{chunk}\033\\'
+                out += f'\033_Ga=T,f=100,q=2,m={0 if last else 1};{chunk}\033\\'
             else:
                 out += f'\033_Gm={0 if last else 1};{chunk}\033\\'
-
         sys.stdout.write(out)
         sys.stdout.flush()
-    except: pass
+    except Exception as e:
+        dbg(f"send_to_kitty error: {e}")
 
-def render_ascii(filepath):
-    """Render using libcaca img2txt — colored ASCII art, transparent background."""
-    try:
-        sz = shutil.get_terminal_size((120, 40))
-        r = subprocess.run(
-            ["img2txt", "-W", str(sz.columns), "-H", str(sz.lines * 2),
-             "-f", "utf8", filepath],
-            capture_output=True, text=True, timeout=2)
-        if r.stdout:
-            # Strip background color codes (48;5;xxx and 48;2;r;g;b) to get transparent bg
-            import re
-            clean = re.sub(r'\033\[48;[25][;0-9]*m', '', r.stdout)
-            sys.stdout.write('\033[H\033[2J' + clean)
-            sys.stdout.flush()
-    except: pass
+# ===================== JPEG STREAM PARSER =====================
 
-def render_blocks(filepath):
-    """Render using chafa — Unicode half-block characters."""
-    try:
-        sz = shutil.get_terminal_size((120, 40))
-        r = subprocess.run(
-            ["chafa", "--size", f"{sz.columns}x{sz.lines - 1}",
-             "--format", "symbols", filepath],
-            capture_output=True, text=True, timeout=2)
-        if r.stdout:
-            sys.stdout.write('\033[H\033[2J' + r.stdout)
-            sys.stdout.flush()
-    except: pass
+JPEG_SOI = b'\xff\xd8'
+JPEG_EOI = b'\xff\xd9'
 
-def render_bw(filepath):
-    """Render using libcaca img2txt — monochrome ASCII, terminal default color only."""
-    try:
-        sz = shutil.get_terminal_size((120, 40))
-        r = subprocess.run(
-            ["img2txt", "-W", str(sz.columns), "-H", str(sz.lines * 2),
-             "-f", "utf8", filepath],
-            capture_output=True, text=True, timeout=2)
-        if r.stdout:
-            # Strip ALL ANSI color/style codes — just raw characters
-            import re
-            clean = re.sub(r'\033\[[0-9;]*m', '', r.stdout)
-            sys.stdout.write('\033[H\033[2J' + clean)
-            sys.stdout.flush()
-    except: pass
+def read_jpeg_from_stream(stream):
+    buf = b''
+    while True:
+        byte = stream.read(1)
+        if not byte:
+            return None
+        buf += byte
+        if buf.endswith(JPEG_SOI):
+            jpeg_data = JPEG_SOI
+            break
+        if len(buf) > 256:
+            buf = buf[-2:]
+    while True:
+        chunk = stream.read(4096)
+        if not chunk:
+            return None
+        jpeg_data += chunk
+        idx = jpeg_data.find(JPEG_EOI, len(jpeg_data) - len(chunk) - 2)
+        if idx >= 0:
+            return jpeg_data[:idx + 2]
 
-# ===================== THREADS =====================
+# ===================== FRAME PROCESSING =====================
+
+def process_8bit(jpeg_data, xpix, ypix):
+    """Upscale with nearest-neighbor, burn FPS, encode JPEG."""
+    img = Image.open(io.BytesIO(jpeg_data)).convert('RGB')
+    img = img.resize((xpix, ypix), Image.NEAREST)
+
+    # FPS overlay
+    draw = ImageDraw.Draw(img)
+    fps_text = f"{_fps:.0f} fps"
+    tw = len(fps_text) * 9
+    th = 16
+    margin = 6
+    rx = xpix - tw - margin * 2
+    ry = margin
+    draw.rectangle([rx, ry, rx + tw + margin * 2, ry + th + margin], fill=(0, 0, 0))
+    draw.text((rx + margin, ry + margin // 2), fps_text, fill=(0, 255, 0), font=_font)
+
+    buf = io.BytesIO()
+    img.save(buf, format='JPEG', quality=75)
+    return buf.getvalue()
+
+def process_ascii(jpeg_data, xpix, ypix, mode="ascii"):
+    """Convert frame to ASCII art rendered as an image."""
+    img = Image.open(io.BytesIO(jpeg_data))
+
+    ascii_cols = min(xpix // 6, 200)
+    ascii_rows = min(ypix // 12, 80)
+    small = img.resize((ascii_cols, ascii_rows))
+
+    if mode == "bw":
+        small = small.convert('L')
+    else:
+        small = small.convert('RGB')
+
+    chars = " .:-=+*#%@"
+    lines = []
+    colors = []
+    px = small.load()
+    for y in range(ascii_rows):
+        line = ""
+        lc = []
+        for x in range(ascii_cols):
+            if mode == "bw":
+                lum = px[x, y]
+                color = (lum, lum, lum)
+            else:
+                r, g, b = px[x, y]
+                lum = int(0.299 * r + 0.587 * g + 0.114 * b)
+                color = (r, g, b)
+            ci = min(int(lum / 256 * len(chars)), len(chars) - 1)
+            line += chars[ci]
+            lc.append(color)
+        lines.append(line)
+        colors.append(lc)
+
+    char_w, char_h = 6, 12
+    out_img = Image.new('RGB', (ascii_cols * char_w, ascii_rows * char_h), (0, 0, 0))
+    draw = ImageDraw.Draw(out_img)
+    for yi, (line, lc) in enumerate(zip(lines, colors)):
+        for xi, (ch, col) in enumerate(zip(line, lc)):
+            if ch != ' ':
+                fill = (255, 255, 255) if mode == "bw" else col
+                draw.text((xi * char_w, yi * char_h), ch, fill=fill, font=_font_small)
+
+    out_img = out_img.resize((xpix, ypix), Image.NEAREST)
+
+    buf = io.BytesIO()
+    out_img.save(buf, format='JPEG', quality=75)
+    return buf.getvalue()
+
+def process_blocks(jpeg_data, xpix, ypix):
+    """Pixelated block effect."""
+    img = Image.open(io.BytesIO(jpeg_data)).convert('RGB')
+    block_w = max(xpix // 8, 60)
+    block_h = max(ypix // 8, 40)
+    small = img.resize((block_w, block_h), Image.NEAREST)
+    out_img = small.resize((xpix, ypix), Image.NEAREST)
+
+    buf = io.BytesIO()
+    out_img.save(buf, format='JPEG', quality=75)
+    return buf.getvalue()
+
+# ===================== RENDER THREAD =====================
 
 def render_thread():
-    """Background thread: grab X screenshots and render them."""
-    fn = {'kitty': render_kitty, 'ascii': render_ascii,
-          'blocks': render_blocks, 'bw': render_bw}.get(RENDER_MODE, render_ascii)
-    while running:
+    """ffmpeg outputs 480x320 JPEG. Python upscales + processes."""
+
+    dbg(f"render_thread: mode={RENDER_MODE}")
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-f", "x11grab",
+        "-video_size", "480x320",
+        "-framerate", "30",
+        "-i", f":{DISPLAY_NUM}",
+        "-f", "image2pipe",
+        "-vcodec", "mjpeg",
+        "-q:v", "5",
+        "pipe:1"
+    ]
+
+    dbg(f"ffmpeg cmd: {' '.join(ffmpeg_cmd)}")
+    errlog = open("/tmp/ffmpeg_stderr.log", "w")
+
+    try:
+        proc = subprocess.Popen(
+            ffmpeg_cmd,
+            stdout=subprocess.PIPE,
+            stderr=errlog
+        )
+        time.sleep(0.5)
+
+        frame_num = 0
+        while running:
+            jpeg_data = read_jpeg_from_stream(proc.stdout)
+            if not jpeg_data:
+                dbg("ffmpeg stream ended")
+                break
+
+            frame_num += 1
+            if frame_num == 1:
+                dbg(f"First frame: {len(jpeg_data)} bytes")
+                try:
+                    with open("/game/screenshots/first_frame.jpg", "wb") as ff:
+                        ff.write(jpeg_data)
+                except:
+                    pass
+
+            xpix, ypix = get_term_pixel_size()
+
+            try:
+                if RENDER_MODE == '8bit':
+                    out_data = process_8bit(jpeg_data, xpix, ypix)
+                elif RENDER_MODE == 'ascii':
+                    out_data = process_ascii(jpeg_data, xpix, ypix, mode='ascii')
+                elif RENDER_MODE == 'bw':
+                    out_data = process_ascii(jpeg_data, xpix, ypix, mode='bw')
+                elif RENDER_MODE == 'blocks':
+                    out_data = process_blocks(jpeg_data, xpix, ypix)
+                else:
+                    out_data = process_8bit(jpeg_data, xpix, ypix)
+
+                if out_data:
+                    send_to_kitty(out_data)
+            except Exception as e:
+                if frame_num < 5:
+                    dbg(f"Frame processing error: {e}")
+
+            update_fps()
+
+        proc.kill()
+        errlog.close()
+
         try:
-            subprocess.run(["import","-window","root","-silent", TMPFRAME],
-                timeout=2, capture_output=True)
-            if os.path.exists(TMPFRAME) and os.path.getsize(TMPFRAME) > 0:
-                fn(TMPFRAME)
+            with open("/tmp/ffmpeg_stderr.log", "r") as f:
+                err = f.read()
+            if err.strip():
+                dbg(f"ffmpeg stderr (last 500):\n{err[-500:]}")
+        except:
+            pass
+
+    except Exception as e:
+        dbg(f"render_thread FATAL: {e}")
+        try: errlog.close()
         except: pass
-        time.sleep(0.01)  # minimize artificial delay — actual fps limited by import+convert speed
+
+# ===================== INPUT =====================
 
 def key_repeat_thread():
-    """Background thread: re-send held keys for continuous movement."""
     while running:
         with lock:
             for c in list(held_keys.keys()):
@@ -300,26 +482,26 @@ def key_repeat_thread():
 def cleanup(*args):
     global running
     running = False
-    # Release all held keys
     with lock:
         for c in list(held_keys.keys()):
             x = KEY_MAP.get(c)
             if x and mgba_win:
                 xdo(mgba_win, x, "keyup")
         held_keys.clear()
-    # Restore terminal
-    sys.stdout.write('\033[?25h')  # show cursor
-    if RENDER_MODE == 'kitty':
-        sys.stdout.write('\033_Ga=d;\033\\')
-    sys.stdout.flush()
+    # Restore TTY FIRST (before any writes)
     if old_settings is not None:
         try:
             import termios
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        except: pass
-    for f in [TMPFRAME, TMPSCALED]:
-        try: os.remove(f)
-        except: pass
+            termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+        except:
+            pass
+    # Clean up display
+    try:
+        sys.stdout.write('\033_Ga=d;\033\\\033[?25h\033[2J\033[H')
+        sys.stdout.flush()
+    except:
+        pass
+    dbg(f"Cleanup complete. Total frames: {_total_frames}")
     sys.exit(0)
 
 # ===================== MAIN =====================
@@ -328,16 +510,19 @@ def main():
     global mgba_win, old_settings, fd
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGWINCH, on_sigwinch)
 
-    # Set up raw terminal input
+    refresh_term_size()
+
     fd = sys.stdin.fileno()
     try:
         import termios, tty
         if os.isatty(fd):
             old_settings = termios.tcgetattr(fd)
             tty.setraw(fd)
+            dbg("TTY: raw mode on stdin")
         else:
-            # stdin not a TTY — try /dev/tty directly
+            dbg("stdin not a TTY, trying /dev/tty")
             try:
                 tfd = os.open('/dev/tty', os.O_RDONLY | os.O_NOCTTY)
                 os.dup2(tfd, fd)
@@ -345,54 +530,115 @@ def main():
                 old_settings = termios.tcgetattr(fd)
                 tty.setraw(fd)
                 sys.stdin = os.fdopen(fd, 'r')
-            except: pass
-    except: pass
+                dbg("TTY: raw mode via /dev/tty")
+            except Exception as e:
+                dbg(f"TTY fallback failed: {e}")
+    except Exception as e:
+        dbg(f"TTY setup error: {e}")
 
-    # Clear screen, hide cursor
     sys.stdout.write('\033[2J\033[H\033[?25l')
     sys.stdout.flush()
 
-    # Find mgba window for input
     mgba_win = find_mgba_window()
+    if not mgba_win:
+        dbg("ERROR: No mGBA window found")
+    else:
+        # Focus the window so XTEST events go to it
+        try:
+            subprocess.run(["xdotool", "windowfocus", "--sync", mgba_win],
+                capture_output=True, timeout=5)
+            subprocess.run(["xdotool", "windowactivate", "--sync", mgba_win],
+                capture_output=True, timeout=5)
+            dbg(f"Focused mGBA window: {mgba_win}")
+        except Exception as e:
+            dbg(f"Failed to focus window: {e}")
 
-    # Start background threads
     threading.Thread(target=render_thread, daemon=True).start()
     threading.Thread(target=key_repeat_thread, daemon=True).start()
 
-    # Main loop: read keypresses (foreground, owns the TTY)
+    import select as sel
     last_time = 0
+    _input_log_count = 0
     while running:
         try:
-            rlist, _, _ = select.select([sys.stdin], [], [], REPEAT_INTERVAL)
+            rlist, _, _ = sel.select([fd], [], [], 0.01)
             if rlist:
-                char = sys.stdin.read(1)
-
-                # Ctrl+C → quit
-                if char == '\x03':
-                    cleanup()
-
-                # Skip escape sequences (kitty graphics responses leak here)
-                if char == '\x1b':
-                    while True:
-                        r2, _, _ = select.select([sys.stdin], [], [], 0.01)
-                        if r2:
-                            c = sys.stdin.read(1)
-                            if c == '\\' or c.isalpha():
-                                break
-                        else:
-                            break
-                    continue
-
-                # Forward game keys
-                if char in KEY_MAP:
-                    with lock:
-                        if char not in held_keys:
-                            if mgba_win:
-                                xdo(mgba_win, KEY_MAP[char], "keydown")
-                            held_keys[char] = True
-                    last_time = time.time()
+                try:
+                    raw = os.read(fd, 256)
+                except (BlockingIOError, OSError):
+                    raw = b''
             else:
-                # No input — release held keys after timeout
+                raw = b''
+
+            if raw:
+                # Log raw bytes received
+                _input_log_count += 1
+                if _input_log_count <= 50:
+                    dbg(f"INPUT raw ({len(raw)} bytes): {raw.hex()} repr={repr(raw)}")
+
+                i = 0
+                chars = []
+                while i < len(raw):
+                    b = raw[i]
+                    if b == 0x1b:
+                        # Escape sequence — determine type and skip entirely
+                        esc_start = i
+                        i += 1
+                        if i < len(raw):
+                            next_b = raw[i]
+                            if next_b == ord('_') or next_b == ord(']'):
+                                # APC (\x1b_) or OSC (\x1b]) sequence
+                                # These run until String Terminator: \x1b\\
+                                i += 1  # skip the _ or ]
+                                while i < len(raw):
+                                    if raw[i] == 0x1b and (i + 1) < len(raw) and raw[i + 1] == ord('\\'):
+                                        i += 2  # skip \x1b\\
+                                        break
+                                    i += 1
+                            elif next_b == ord('['):
+                                # CSI sequence: \x1b[ ... ends at alpha char
+                                i += 1  # skip [
+                                while i < len(raw):
+                                    c = raw[i]
+                                    i += 1
+                                    if c >= ord('@') and c <= ord('~'):
+                                        break
+                            else:
+                                # Other escape: skip until alpha or backslash
+                                i += 1
+                                while i < len(raw):
+                                    c = raw[i]
+                                    i += 1
+                                    if c == ord('\\') or (c >= ord('A') and c <= ord('z')):
+                                        break
+                        if _input_log_count <= 50:
+                            dbg(f"INPUT skipped escape ({i - esc_start} bytes): {raw[esc_start:i].hex()}")
+                    elif b == 0x03:
+                        dbg("INPUT: Ctrl+C received")
+                        cleanup()
+                    else:
+                        chars.append(chr(b))
+                        i += 1
+
+                if chars and _input_log_count <= 50:
+                    dbg(f"INPUT parsed chars: {chars}")
+
+                for char in chars:
+                    if char in KEY_MAP:
+                        mapped = KEY_MAP[char]
+                        with lock:
+                            if char not in held_keys:
+                                if mgba_win:
+                                    dbg(f"INPUT keydown: '{char}' -> xdotool keydown '{mapped}' to window {mgba_win}")
+                                    xdo(mgba_win, mapped, "keydown")
+                                else:
+                                    dbg(f"INPUT keydown: '{char}' but NO mgba_win!")
+                                held_keys[char] = True
+                        last_time = time.time()
+                    else:
+                        if _input_log_count <= 50:
+                            dbg(f"INPUT char '{char}' (0x{ord(char):02x}) not in KEY_MAP")
+            else:
                 if time.time() - last_time > REPEAT_INTERVAL * 3:
                     with lock:
                         for c in list(held_keys.keys()):
@@ -400,24 +646,25 @@ def main():
                             if x and mgba_win:
                                 xdo(mgba_win, x, "keyup")
                         held_keys.clear()
-        except: pass
+
+        except Exception as e:
+            dbg(f"INPUT loop exception: {e}")
 
 if __name__ == "__main__":
     main()
 UIPY
   chmod +x /usr/local/bin/emulator_ui.py
 
-  # --- Verify ---
   echo ""
   echo "========================================"
   echo "  GAMEBOY EMULATOR BUILD VERIFICATION"
   echo "========================================"
   which mgba      && echo "mgba:      OK" || echo "FAIL: mgba"
-  which ffmpeg    && echo "ffmpeg:    OK" || echo "FAIL: ffmpeg"
   which chafa     && echo "chafa:     OK" || echo "FAIL: chafa"
   which import    && echo "import:    OK" || echo "FAIL: import"
   which xdotool   && echo "xdotool:   OK" || echo "FAIL: xdotool"
   which img2txt   && echo "img2txt:   OK" || echo "FAIL: img2txt"
+  python3 -c "from PIL import Image; print('PIL:       OK')" 2>/dev/null || echo "FAIL: PIL"
   echo "========================================"
 
 %environment
@@ -433,135 +680,115 @@ UIPY
 %runscript
   ROM=$(find /game -maxdepth 1 -name "*.gba" | head -1)
   if [ -z "$ROM" ]; then
-    echo "❌ No .gba ROM found in /game/"
+    echo "No .gba ROM found in /game/"
     exit 1
   fi
-  echo "✅ ROM: $ROM"
+  echo "ROM: $ROM"
 
   DISPLAY_NUM=99
   while [ -f /tmp/.X${DISPLAY_NUM}-lock ]; do DISPLAY_NUM=$((DISPLAY_NUM+1)); done
   export DISPLAY=":${DISPLAY_NUM}"
-  echo "✅ Using display :${DISPLAY_NUM}"
+  echo "Using display :${DISPLAY_NUM}"
 
-  # --- Detect terminal pixel size so Xvfb matches ---
-  # Does detection + rounding to multiple of 8 all in Python
-  XVFB_RES=$(python3 -c "
-import struct, shutil, os, sys
-w, h = 0, 0
-for fd_num in [1, 0, 2]:
-    try:
-        import fcntl, termios
-        r = fcntl.ioctl(fd_num, termios.TIOCGWINSZ, b'\x00'*8)
-        rows, cols, xpix, ypix = struct.unpack('HHHH', r)
-        if xpix > 0 and ypix > 0:
-            w, h = xpix, ypix
-            break
-    except: pass
-if w == 0:
-    try:
-        fd = os.open('/dev/tty', os.O_RDONLY)
-        import fcntl, termios
-        r = fcntl.ioctl(fd, termios.TIOCGWINSZ, b'\x00'*8)
-        os.close(fd)
-        rows, cols, xpix, ypix = struct.unpack('HHHH', r)
-        if xpix > 0 and ypix > 0:
-            w, h = xpix, ypix
-    except: pass
-if w == 0:
-    try:
-        sz = shutil.get_terminal_size((120, 40))
-        w, h = sz.columns * 14, sz.lines * 34
-    except:
-        w, h = 1920, 1080
-# Round up to multiple of 8 for Xvfb
-w = ((w + 7) // 8) * 8
-h = ((h + 7) // 8) * 8
-print(f'{w}x{h}')
-" 2>/dev/null)
+  RENDER_MODE="${RENDER_MODE:-auto}"
+  if [ "$RENDER_MODE" = "auto" ]; then
+    RENDER_MODE="8bit"
+  fi
+  echo "Render mode: ${RENDER_MODE}"
 
-  # Fallback if detection failed
-  [ -z "$XVFB_RES" ] && XVFB_RES="1920x1080"
-  echo "✅ Xvfb resolution: $XVFB_RES"
+  XVFB_RES="480x320"
+  echo "Xvfb resolution: ${XVFB_RES}"
 
   cleanup() {
-    printf '\033[?25h'
-    kill $MGBA_PID $XVFB_PID 2>/dev/null
+    kill $MGBA_PID $UNCLUTTER_PID 2>/dev/null
+    sleep 0.5
+    kill $XVFB_PID 2>/dev/null
     wait 2>/dev/null
+    # Copy debug log to game dir for later inspection
+    cp /tmp/emulator_debug.log /game/screenshots/debug.log 2>/dev/null
+    cp /tmp/ffmpeg_stderr.log /game/screenshots/ffmpeg.log 2>/dev/null
+    # Hard reset terminal to clean state
+    printf '\033[?25h'
+    printf '\033[2J\033[H'
+    stty sane 2>/dev/null
+    reset 2>/dev/null
     echo ""
-    echo "👋 Emulator closed."
+    echo "Emulator closed. Debug log saved to screenshots/debug.log"
   }
   trap cleanup EXIT INT TERM
 
-  echo "🖥  Starting Xvfb at ${XVFB_RES}..."
   Xvfb :${DISPLAY_NUM} -screen 0 ${XVFB_RES}x24 +extension RANDR &
   XVFB_PID=$!
   sleep 2
   if ! kill -0 $XVFB_PID 2>/dev/null; then
-    echo "❌ Xvfb failed!"; exit 1
+    echo "Xvfb failed!"; exit 1
   fi
-  echo "✅ Xvfb running"
+  echo "Xvfb running"
 
-  # Launch mgba — tell it to use the full display
-  echo "🎮 Starting mgba..."
+  # Hide the X11 cursor using unclutter (hides after 0s idle, keeps hidden)
+  DISPLAY=:${DISPLAY_NUM} unclutter -idle 0 -root &
+  UNCLUTTER_PID=$!
+  # Also move cursor off-screen as backup
+  sleep 0.5
+  DISPLAY=:${DISPLAY_NUM} xdotool mousemove --screen 0 9999 9999 2>/dev/null
+
   DISPLAY=:${DISPLAY_NUM} SDL_VIDEO_WINDOW_POS="0,0" mgba -c /etc/mgba/mgba.ini -f "$ROM" &
   MGBA_PID=$!
   sleep 3
   if ! kill -0 $MGBA_PID 2>/dev/null; then
-    echo "❌ mgba failed!"; kill $XVFB_PID 2>/dev/null; exit 1
+    echo "mgba failed!"; kill $XVFB_PID 2>/dev/null; exit 1
   fi
-  echo "✅ mgba running"
+  echo "mgba running"
 
-  echo "🔍 Verifying display..."
+  # Diagnostic: confirm config contents
+  echo "--- mGBA config ---"
+  cat /etc/mgba/mgba.ini
+  echo "---"
+
+  # Diagnostic: test xdotool XTEST on this display
+  echo "Testing xdotool..."
+  DISPLAY=:${DISPLAY_NUM} xdotool key e 2>&1 && echo "xdotool key: OK" || echo "xdotool key: FAILED"
+  DISPLAY=:${DISPLAY_NUM} xdotool getactivewindow 2>&1 && echo "Active window found" || echo "No active window"
+
   DISPLAY=:${DISPLAY_NUM} import -window root -silent /tmp/.verify.png 2>/dev/null
   if [ -f /tmp/.verify.png ] && [ -s /tmp/.verify.png ]; then
-    echo "✅ Display is rendering"
+    DIMS=$(identify /tmp/.verify.png 2>/dev/null | grep -oP '\d+x\d+' | head -1)
+    echo "Display verified: ${DIMS}"
+    cp /tmp/.verify.png /game/screenshots/startup_verify.png 2>/dev/null
     rm -f /tmp/.verify.png
-  else
-    echo "⚠  Display may not be rendering"
-  fi
-
-  RENDER_MODE="${RENDER_MODE:-auto}"
-  if [ "$RENDER_MODE" = "auto" ]; then
-    if [ "$TERM" = "xterm-kitty" ] || [ -n "$KITTY_PID" ] || [ -n "$KITTY_WINDOW_ID" ]; then
-      RENDER_MODE="kitty"
-    else
-      RENDER_MODE="ascii"
-    fi
   fi
 
   clear
-  echo "🎮 $(basename "$ROM") — ${RENDER_MODE} mode — Ctrl+C to quit"
+  echo "$(basename "$ROM") — ${RENDER_MODE} mode — Ctrl+C to quit"
   sleep 1
 
-  # Single combined process handles both rendering and input
   python3 /usr/local/bin/emulator_ui.py "$DISPLAY_NUM" "$RENDER_MODE"
 
 %test
   which mgba     && echo "mgba OK"     || exit 1
   which Xvfb     && echo "Xvfb OK"     || exit 1
-  which ffmpeg   && echo "ffmpeg OK"   || exit 1
   which chafa    && echo "chafa OK"    || exit 1
   which import   && echo "import OK"   || exit 1
   which xdotool  && echo "xdotool OK"  || exit 1
   which img2txt  && echo "img2txt OK"  || exit 1
+  python3 -c "from PIL import Image; print('PIL OK')" || exit 1
   echo "Smoke test passed"
 
 %help
-  GameBoy Emulator Container v3.0
+  GameBoy Emulator Container v5.5
   ================================
   Controls:
     W/A/S/D = D-Pad    L = A    P = B    E = Start    Q = Select
     O = L bumper    K = R bumper    Ctrl+C = Quit
 
   Render modes (set RENDER_MODE env var):
-    kitty  — native pixel rendering (auto-detected in Kitty terminal)
-    ascii  — colored ASCII art with transparent background
-    bw     — monochrome ASCII art (terminal default color only)
-    blocks — Unicode half-block pixels
-    Example: RENDER_MODE=bw ./critical_analysis.sh /path/to/games firered
+    8bit   — pixel rendering via Kitty graphics protocol (default)
+    ascii  — colored ASCII art rendered as image via Kitty
+    bw     — monochrome ASCII art rendered as image via Kitty
+    blocks — pixelated block art rendered as image via Kitty
 
   Build:
     sudo singularity build ga_em.sif Singularity_gb_emulator
-
   Run:
     ./critical_analysis.sh /path/to/games firered
+    RENDER_MODE=ascii ./critical_analysis.sh /path/to/games firered
